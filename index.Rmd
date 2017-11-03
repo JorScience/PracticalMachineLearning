@@ -1,0 +1,238 @@
+---
+title: "Course Project Practical Machine Learning"
+author: "Jorik Schra"
+date: '`r Sys.Date()`'
+output:
+  prettydoc::html_pretty:
+  keep_md: true
+  theme: cayman
+  highlight: github
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE)
+```
+
+## Summary
+
+For this project, machine learning algorithms will be used in an attempt to correctly classify five ways of performing the Unilateral Dumbell Biceps Curl. To do so, the data is processed and cleaned, after which five different models are estimated and cross-validated to evaluate which model can classify the data best and how well it does so. The results show that the best performing model uses gradient boosting, with an in sample error of 0.29% and an out of sample error of 0.53%. 
+
+## Introduction
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity relatively inexpensively. These type of devices are part of the quantified self movement - a group of enthusiasts who take measurements about themselves regularly to improve their health, to find patterns in their behavior, or because they are tech geeks. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. In this project, the goal is to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants to predict in which way the Unilateral Dumbell Biceps Curl (UDBC) is performed by a participant. They were asked to perform UDBC lifts correctly and incorrectly in 5 different ways. The  `classe` variable indicates how the activity was performed, where A indicates performance according to the specification, whereas B, C, D and E are classes which indicate common mistakes. 
+
+More information is available from the website here: http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har
+
+## Library and data
+First, the required packages for the analysis must be loaded and the data must be read into R. 
+
+```{r}
+# Library
+library(ggplot2)
+library(scales)
+library(dplyr)
+library(magrittr)
+library(caret)
+library(MASS)
+library(nnet)
+library(randomForest)
+library(parallel)
+library(doParallel)
+library(e1071)
+library(knitr)
+```
+
+```{r}
+# Working directory
+setwd("D:/R Directories/Coursera/Practical Machine Learning/PML")
+
+# Load test- and train datasets
+test <- read.csv("pml-testing.csv")
+train <- read.csv("pml-training.csv")
+```
+
+## Cleaning the dataset
+Using the `str` function, an initial idea of the dataset can be obtained, the output of which can be found in appendix A. Several issues are immediately apparent:
+
+* The first 7 variables do not stem from accelerometer measurements, whereas the goal of this project is to use accelerometer data for predictions;
+* Many variables contain missing values.
+
+The first issue is easily tackled, as the first 7 variables can simply be removed. Additionally, the response variable `classe` will be put into a seperate vector, while column 160 of the test set (`r names(test)[160]`) will also be removed, as it is an ID column. To address the second issue, more insight in the occurence of missing values in the data is required.
+
+```{r, echo=FALSE}
+strdf <- train
+```
+```{r, comment=""}
+# Remove response and unnecessary variables
+response <- train[,160]
+train <- train[,-c(1:7, 160)]
+test <- test[,-c(1:7, 160)]
+
+# Missing values
+dfm <- rbind(train,test) %>%
+      apply(2, as.numeric) %>%
+      apply(2, function(x) sum(is.na(x))) %>%
+      {data.frame(Names=names(.), MV=.)}
+
+tbl <- table(dfm$MV)
+tbl <- data.frame(names(tbl), as.numeric(tbl))
+colnames(tbl) <- c("Number of missing values", "Frequency")
+
+kable(tbl, format="html", caption="Frequencies of missing values")
+```
+
+
+The table shows the amount of columns which have a specific sum of missing values. Accordingly, there are 52 columns which have no missing values, while all other columns have between 19236 and 19642 missing values. Given that the combined dataset contains 19642 observations, imputation cannot be used to clean these variables for analysis. Hence, all columns which contain missing values shall be removed from the dataset.
+
+```{r}
+# Remove variables with too many MV's
+dfm <- dfm %>%
+      filter(MV >0) %>%
+      .$Names
+      
+train <- train[,!(names(train) %in% dfm)]
+test <- test[,!(names(test) %in% dfm)]
+rm(dfm)
+```
+
+Before proceeding to the analysis, a last check on the variables is performed to evaluate if any of them have (near-) zero variance, as this may be problematic for further analyses. To do so, `nearZeroVar` from caret is used, the output of which can be found in appendix B.
+```{r, echo=FALSE}
+# Near zero variance
+nzvdf <- nearZeroVar(rbind(train, test), saveMetrics=T)
+```
+As the output contains no (near-) zero variance variables, the next step is to split the data set.
+
+# Splitting the data set
+As the project requires an estimate for both the in sample error and out of sample error, the training set is split into a training and validation set. The training set, which will contain 75% of the observations, will then be used to pick the best model for prediction, which will subsequently be used on the validation set, which contains the remaining 25% of observations, to estimate out of sample error. Note that the response vector is also split.
+
+```{r}
+# Split training set
+inTrain <- createDataPartition(response, p=3/4, list=F)
+valid <- train[-inTrain,]
+train <- train[inTrain,]
+responseT <- response[inTrain]
+responseV <- response[-inTrain]
+rm(inTrain, response)
+```
+
+## Model testing
+To evaluate how well the response variable can be predicted, five machine learning algorithms will be tested:
+
+* Multinomial logistic regression;
+* Linear discriminant analysis;
+* Random forest;
+* Support vector machine (with linear kernel);
+* Gradient boosting.
+
+To pick the best model, cross validation is used with 10 folds. Additionally, the used variables are centered and scaled, to further increase the predictive power of the models.
+
+```{r}
+# Training parameters
+ctrl <- trainControl(method="cv", number=10, allowParallel=T)
+preP <- preProcess(train, method=c("center", "scale"))
+train_stand <- predict(preP, train)
+```
+
+As the estimation of the models can be quite computationally demanding, parallel processing is used to speed up the process. Note that this is completely optional, and can be opted out of by not running the subsequent code chunck and setting `allowParallel` in the previous code chunck equal to FALSE (F).
+
+```{r}
+# Enable parallelized computing
+cluster <- makeCluster(detectCores()-1)
+registerDoParallel(cluster)
+```
+
+Next, the models are estimated and saved for subsequent evaluation.
+
+```{r, cache=T}
+# Multinomial logistic regression
+set.seed(2017)
+logfit <- train(x=train_stand, y=responseT, method="multinom", 
+                trControl=ctrl, trace=FALSE)
+
+# Linear discriminant analysis
+set.seed(2017)
+ldafit <- train(x=train_stand, y=responseT, method="lda", 
+                trControl=ctrl)
+
+# Random forest
+set.seed(2017)
+rffit <- train(x=train_stand, y=responseT, method="rf", 
+               trControl=ctrl)
+
+# Support vector machine with linear kernel
+set.seed(2017)
+lsvmfit <- train(x=train_stand, y=responseT, method="svmLinear", 
+                 tunelength=14, trControl=ctrl)
+
+# XGBOOST
+set.seed(2017)
+xgbfit <- train(x=train_stand, y=responseT, method="xgbLinear",  
+                trControl=ctrl, nthread=1)
+
+# Stop parallel
+stopCluster(cluster)
+rm(cluster)
+```
+
+Having estimated all models, the subsequent code is used to combine all models into one object, after which a parallel plot is shown and the `summary` function is used to analyse the results.
+
+```{r}
+#
+allResamples <- resamples(list("Multinom log" = logfit,
+                               "LDA" = ldafit,
+                               "RandomForest" = rffit,
+                               "Linear SVM" = lsvmfit,
+                               "XGBoost" = xgbfit)
+)
+parallelplot(allResamples)
+```
+
+As is apparant from the parallel plot, the RandomForest and XGBoost models vastly outperformed the other models on all folds, with accuracies close to 1. Furthermore, the XGBoost models seem to outperform the RandomForest models by a fraction, which is best further analyzed by using summary statistics.
+
+```{r, comment=""}
+summary(allResamples)
+```
+
+As can be seen from the accuracy table, overall the models performed quite well, as the worst model (LDA) already had an accuracy of 0.6836. The RandomForest and XGBoost models performed best, as was also seen in the parallel plot, with XGBoost achieving the highest accuracy, albeit by a fraction. 
+
+The XGBoost models produced the following classifications:
+
+```{r, comment=""}
+confusionMatrix(xgbfit)
+```
+
+The confusion matrix shows that the models only misclassified among the wrongfully executed UDBC's, whereas it correctly classified all correct performances. With an overall in sample error of 0.0029, the next step is to evaluate the best model's estimated out of sample error by using the validation set.
+
+```{r, comment=""}
+# Out of sample error
+preddat <- predict(preP, valid)
+yclass <- predict(xgbfit, preddat)
+confusionMatrix(yclass, responseV)
+
+```
+
+Using the validation set, similar results arise from the confusion matrix. The model has been able to correctly classify all correct executions of the UDBC, while making only few mistakes in the classification of the wrongful executions of the exercise. With an out of sample error of 0.0053, the model is ready to be used on the test set.
+
+
+```{r, comment=""}
+# Preprocess testdata and classify
+testdat <- predict(preP, test)
+yclass <- predict(xgbfit, testdat)
+yclass
+```
+
+Having obtained these predictions, which will be used in the Course Project Prediction Quiz, this report has reached its end. For those who have read all the way through it, thank you for your time, and I hope you found my analysis interesting!
+<br>
+<br>
+
+## Appendix
+
+### A.
+```{r}
+str(strdf[,1:99])
+str(strdf[,100:160])
+```
+
+### B.
+```{r}
+nzvdf
+```
